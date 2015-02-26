@@ -261,7 +261,19 @@ enum SyntaxKindNames {
     FirstNode = 120,
 }
 
-function search(node: ts.Node, each: (descendent: ts.Node) => boolean, depth: number) {
+function printNodes(node: ts.Node, depth: number) {
+    console.log(indent(depth) + "node: " + SyntaxKindNames[node.kind])
+    ts.forEachChild(node, child => printNodes(child, depth + 1));
+}
+
+function isExported(node: ts.Node) {
+    return (node.flags & ts.NodeFlags.Export) !== 0;
+}
+
+function search(node: ts.Node,
+                each: (descendent: ts.Node) => boolean,
+                depth: number) {
+
     ts.forEachChild(node, child => {
         if (each(child) !== false) {
             search(child, each, depth + 1);
@@ -273,12 +285,12 @@ var filesExcluded: { [name: string]: boolean } = {};
 
 function forEachFilteredNode<T extends ts.Node>(
     nodes: T[],
-    filePrefixes: string[],
+    filePrefix: string,
     each: (node: T) => void
 ) {
     nodes.forEach(n => {
         var fileName = n.getSourceFile().filename;
-        if (filePrefixes.some(p => fileName.startsWith(p))) {
+        if (fileName.startsWith(filePrefix)) {
             each(n);
         } else {
             filesExcluded[fileName] = true;
@@ -286,40 +298,70 @@ function forEachFilteredNode<T extends ts.Node>(
     });
 }
 
+interface VariableLikeDeclaration extends ts.Declaration {
+    type?: ts.TypeNode;
+}
+
+function getDeclarationName(decl: ts.Declaration) {
+    var i = <ts.Identifier>decl.name;
+    if (i.text) {
+        return i.text;
+    }
+
+    var l = <ts.LiteralExpression>decl.name;
+    if (l.text) {
+        return l.text;
+    }
+
+    return "(expression)";
+}
+
+function getDeclarationPath(decl: ts.Declaration) {
+    var path: string[] = [];
+    for (var node = decl.parent; !!node; node = node.parent) {
+        var d = <ts.Declaration>node;
+        if (d.name) {
+            path.push(getDeclarationName(d) + ":" + SyntaxKindNames[d.kind]);
+        }
+    }
+    return path.join(".");
+}
+
 class Members {
-    variables: ts.VariableDeclaration[] = [];
-    functions: ts.FunctionDeclaration[] = [];
+    variables: VariableLikeDeclaration[] = [];
+    functions: ts.FunctionLikeDeclaration[] = [];
     contributingFiles: { [path: string]: boolean } = {};
 
-    add(node: ts.Node, depth: number, file: string) {
+    add(node: ts.Node, depth: number, file: string,
+        handler?: (node: ts.Node) => boolean) {
 
         this.contributingFiles[file] = true;
         search(node, child => {
             switch(child.kind) {
                 case ts.SyntaxKind.VariableDeclaration:
-                    this.variables.push(<ts.VariableDeclaration>child);
+                case ts.SyntaxKind.Property:
+                    this.variables.push(<VariableLikeDeclaration>child);
                     return false;
                 case ts.SyntaxKind.FunctionDeclaration:
-                    this.functions.push(<ts.FunctionDeclaration>child);
+                case ts.SyntaxKind.Method:
+                    this.functions.push(<ts.FunctionLikeDeclaration>child);
                     return false;
             }
+            return handler ? handler(child) : true;
         }, depth);
     }
 
-    constructor(node: ts.Node, depth: number, file: string) {
-        this.add(node, depth, file);
+    print(depth: number, filePrefix: string) {
+        forEachFilteredNode(this.variables, filePrefix, v =>
+            console.log(indent(depth) + "variable " + getDeclarationName(v) +
+            " (" + getDeclarationPath(v) + ")"));
+        forEachFilteredNode(this.functions, filePrefix, f =>
+            console.log(indent(depth) + "function " + getDeclarationName(f)));
     }
 
-    print(depth: number, filePrefixes: string[]) {
-        forEachFilteredNode(this.variables, filePrefixes, v =>
-            console.log(indent(depth) + "variable " + v.name.text));
-        forEachFilteredNode(this.functions, filePrefixes, f =>
-            console.log(indent(depth) + "function " + f.name.text));
-    }
-
-    filter(filePrefixes: string[]) {
+    filter(filePrefix: string) {
         return Object.keys(this.contributingFiles).some(path => {
-            if (filePrefixes.some(prefix => path.startsWith(prefix))) {
+            if (path.startsWith(filePrefix)) {
                 return true;
             }
             filesExcluded[path] = true;
@@ -328,11 +370,8 @@ class Members {
     }
 }
 
-class Interface extends Members {
-    constructor(public node: ts.InterfaceDeclaration, depth: number, file: string) {
-        super(node, depth, file);
-    }
-}
+class Interface extends Members {}
+class Class extends Members {}
 
 function getOrCreate<T>(from: { [name:string]: T }, name: string, create: () => T) {
     return from[name] || (from[name] = create());
@@ -340,67 +379,87 @@ function getOrCreate<T>(from: { [name:string]: T }, name: string, create: () => 
 
 function forEach<T extends Members>(
     from: { [name:string]: T },
-    filePrefixes: string[],
+    filePrefix: string,
     each: (name: string, item: T) => void) {
     Object.keys(from).forEach(key => {
         var item = from[key];
-        if (item.filter(filePrefixes)) {
+        if (item.filter(filePrefix)) {
             each(key, from[key]);
         }
     });
 }
 
-class AmbientModule extends Members {
-    modules: { [name: string]: AmbientModule } = {};
+class Module extends Members {
+    modules: { [name: string]: Module } = {};
     interfaces: { [name: string]: Interface } = {};
+    classes: { [name: string]: Class } = {};
 
     add(node: ts.Node, depth: number, file: string) {
-        super.add(node, depth, file);
-        search(node, child => {
+        super.add(node, depth, file, child => {
             switch (child.kind) {
                 case ts.SyntaxKind.ModuleDeclaration:
                     var md = <ts.ModuleDeclaration>child;
-                    getOrCreate(this.modules, md.name.text, () => new AmbientModule(md, depth + 1, file));
+                    getOrCreate(this.modules, md.name.text,
+                        () => new Module()).add(md, depth + 1, file);
                     return false;
                 case ts.SyntaxKind.InterfaceDeclaration:
                     var id = <ts.InterfaceDeclaration>child;
-                    getOrCreate(this.interfaces, id.name.text, () => new Interface(id, depth + 1, file));
+                    getOrCreate(this.interfaces, id.name.text,
+                        () => new Interface()).add(id, depth + 1, file);
+                    return false;
+                case ts.SyntaxKind.ClassDeclaration:
+                    var cd = <ts.ClassDeclaration>child;
+                    getOrCreate(this.classes, cd.name.text,
+                        () => new Class()).add(cd, depth + 1, file);
                     return false;
             }
-        }, depth);
+        });
     }
 
-    constructor(public node: ts.Node, depth: number, file: string) {
-        super(null, depth, file);
-        this.add(node, depth, file);
-    }
-
-    print(depth: number, filePrefixes: string[]) {
-        forEach(this.modules, filePrefixes, (name, module) => {
+    print(depth: number, filePrefix: string) {
+        forEach(this.modules, filePrefix, (name, module) => {
             console.log(indent(depth) + "module " + name);
-            module.print(depth + 1, filePrefixes);
+            module.print(depth + 1, filePrefix);
         });
 
-        forEach(this.interfaces, filePrefixes, (name, interface) => {
+        forEach(this.interfaces, filePrefix, (name, interface) => {
             console.log(indent(depth) + "interface " + name);
-            interface.print(depth + 1, filePrefixes);
+            interface.print(depth + 1, filePrefix);
         });
 
-        super.print(depth, filePrefixes);
+        forEach(this.classes, filePrefix, (name, cls) => {
+            console.log(indent(depth) + "class " + name);
+            cls.print(depth + 1, filePrefix);
+        });
+
+        super.print(depth, filePrefix);
     }
 }
 
-var globals = new AmbientModule(null, 0, "");
+var globals = new Module();
+
+class ExternalModule extends Module {
+    constructor(public path: string) {
+        super();
+    }
+}
+
+var externals: ExternalModule[] = [];
+
+var inputPath = process.argv[2];
+if (!inputPath.endsWith(path.sep)) {
+    inputPath += path.sep;
+}
 
 export function scan(sourceFile: ts.SourceFile) {
-
-//    console.log(sourceFile.filename);
-
-    var externalModule = sourceFile.statements.some(
-        s => (s.flags & ts.NodeFlags.Export) !== 0);
-
-    if (externalModule) {
-
+    if (sourceFile.statements.some(isExported)) {
+        var path = sourceFile.filename;
+        if (path.startsWith(inputPath)) {
+            path = path.substr(inputPath.length);
+        }
+        var mod = new ExternalModule(path);
+        mod.add(sourceFile, 1, sourceFile.filename);
+        externals.push(mod);
     } else {
         globals.add(sourceFile, 1, sourceFile.filename);
     }
@@ -418,8 +477,7 @@ function recurseFiles(p: string) {
     }
 }
 
-var inputPaths = process.argv.slice(2);
-inputPaths.forEach(recurseFiles);
+recurseFiles(inputPath);
 
 var options: ts.CompilerOptions = {
     target: ts.ScriptTarget.ES5,
@@ -430,7 +488,10 @@ var program = ts.createProgram(fileNames, options, host);
 
 program.getSourceFiles().forEach(scan);
 
-globals.print(0, inputPaths);
+console.log("globals");
+globals.print(1, inputPath);
 
-console.log("Excluded:");
-Object.keys(filesExcluded).forEach(f => console.log(f));
+externals.forEach(e => {
+    console.log("external: " + e.path);
+    e.print(1, inputPath);
+});
